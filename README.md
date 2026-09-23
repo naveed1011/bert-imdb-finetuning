@@ -53,25 +53,24 @@ All figures and raw data are in the [`results/`](results/) folder. Key numbers a
 
 bert-imdb-finetuning/
 ├── README.md
-├── PUSH_TO_GITHUB.md # Step-by-step commands for publishing
-├── LICENSE # MIT
-├── requirements.txt # For local runs — Kaggle has everything pre-installed
+├── LICENSE                         # MIT
+├── requirements.txt                # For local runs — Kaggle has everything pre-installed
 ├── notebooks/
-│ └── bert_imdb_finetuning.ipynb # Main notebook — Run All on Kaggle GPU
+│   └── bert_imdb_finetuning.ipynb  # Main notebook — Run All on Kaggle GPU
 ├── scripts/
-│ ├── notebook_source_part*.txt # Readable, diffable notebook source files
-│ ├── build_notebook.py # Builds and validates the .ipynb from source files
-│ └── test_data_loading.py # Unit test for the data pipeline (runs on CPU)
+│   ├── notebook_source_part*.txt   # Readable, diffable notebook source files
+│   ├── build_notebook.py          # Builds and validates the .ipynb from source files
+│   └── test_data_loading.py        # Unit test for the data pipeline (runs on CPU)
 ├── docs/
-│ ├── LEARNING_LOG.md # v1 → v2 → v3: mistakes, fixes, and what I learned
-└── results/ # Results from the full Kaggle GPU run
-├── summary.json # All key numbers, machine-readable
-├── test_classification_report.txt
-├── experiment_comparison.csv
-├── misclassified_examples.csv
-├── eda_overview.png
-├── token_length_distribution.png
-├── training_curves.png
-├── confusion_matrix_full_ft.png
-├── freezing_experiment_comparison.png
-└── all_experiments_curves.png
+│   └── LEARNING_LOG.md             # v1 → v2 → v3: mistakes, fixes, and what I learned
+└── results/                        # Results from the full Kaggle GPU run
+    ├── summary.json                # All key numbers, machine-readable
+    ├── test_classification_report.txt
+    ├── experiment_comparison.csv
+    ├── misclassified_examples.csv
+    ├── eda_overview.png
+    ├── token_length_distribution.png
+    ├── training_curves.png
+    ├── confusion_matrix_full_ft.png
+    ├── freezing_experiment_comparison.png
+    └── all_experiments_curves.png
