@@ -1,0 +1,14 @@
+{
+  "train_runtime": 6474.7499,
+  "train_samples_per_second": 17.375,
+  "train_steps_per_second": 0.272,
+  "total_flos": 2.928237551752296e+16,
+  "train_loss": 1.2099487369710749,
+  "epoch": 5.0,
+  "best_val_accuracy": 0.9356,
+  "best_epoch": 5.0,
+  "train_time_min": 107.91933431228001,
+  "peak_vram_gb": 4.565187072,
+  "data_source": "Hugging Face Hub \u2014 official IMDB split (loaded in 3s)",
+  "model_source": "bert-base-uncased [Hugging Face Hub]"
+}

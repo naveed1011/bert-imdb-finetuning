@@ -1,0 +1,715 @@
+<<<MD>>>
+## 4. Full Fine-Tuning
+
+Every hyperparameter, and *why*:
+
+| Choice | Value | Rationale |
+|---|---|---|
+| Optimizer | AdamW, `wd=0.01` | standard for BERT; decoupled weight decay regularizes the 110M trunk |
+| Learning rate | `2e-5` | the canonical BERT fine-tuning LR (Devlin et al. used 2e-5–5e-5; larger LRs destroy pretrained features) |
+| LR schedule | linear decay, 10% warmup | warmup stabilizes Adam's second-moment estimates early in FT |
+| Effective batch | `8 × 4 accum = 32` | gradient accumulation buys a big-batch recipe inside a 16 GB VRAM budget |
+| Precision | fp16 on GPU | T4 tensor cores ≈ 2× throughput, half the activation memory |
+| Epoch budget | 5 (max) | BERT on IMDB typically peaks at epoch 2–4 and then overfits |
+| Early stopping | patience 2, Δ≥0.001 on **val** accuracy | checkpoint selection must never involve the test set |
+| Best-model policy | `load_best_model_at_end` by `eval_accuracy` | the artifact we ship is the *validation-best* checkpoint |
+
+**Compute budget (why this fits Kaggle):** 22,500 samples ÷ 32 effective batch ≈ 704 optimizer steps/epoch.
+On a T4 with dynamic padding + fp16, expect roughly 20–35 min/epoch → the full notebook (fine-tune +
+2 ablations + evaluations) lands around **2–3.5 h**, inside Kaggle's 9 h batch / 12 h interactive limits
+with margin. Peak VRAM is measured and printed per run.
+<<<CODE>>>
+# ══════════════════════════════════════════════════════════════════════════
+# 4a. TRAINING SETUP
+# ══════════════════════════════════════════════════════════════════════════
+# Warmup as a STEP count (transformers>=5.0 removed `warmup_ratio`; computing
+# the steps ourselves keeps the notebook compatible with 4.x and 5.x alike).
+steps_per_epoch = max(1, math.ceil(len(tokenized_train) / (TRAIN_BS * ACCUM_STEPS)))
+total_steps_est = steps_per_epoch * NUM_EPOCHS
+WARMUP_STEPS = int(total_steps_est * WARMUP_RATIO)
+
+
+def make_training_args(**kwargs):
+    """Cross-version TrainingArguments factory.
+
+    The HF API evolves between major releases (e.g. `logging_dir` was removed in
+    transformers 5.0; `evaluation_strategy` was renamed to `eval_strategy` in 4.41).
+    Instead of pinning one version, we silently drop kwargs the *installed*
+    transformers does not accept, and report what was dropped. This keeps the
+    notebook runnable on whatever image Kaggle ships while documenting drift.
+    """
+    import inspect
+    supported = set(inspect.signature(TrainingArguments.__init__).parameters)
+    dropped = [k for k in kwargs if k not in supported]
+    if dropped:
+        print(f"  (compat note: transformers {transformers.__version__} ignores: {dropped})")
+    return TrainingArguments(**{k: v for k, v in kwargs.items() if k in supported})
+
+
+def best_epoch_of(tr):
+    """Best epoch across transformers versions: 4.x stores `state.best_epoch`;
+    5.x removed it — there we recover it from the eval log entry whose
+    accuracy equals `state.best_metric`."""
+    ep = getattr(tr.state, "best_epoch", None)
+    if ep is not None:
+        return ep
+    bm = getattr(tr.state, "best_metric", None)
+    if bm is not None:
+        for e in tr.state.log_history:
+            if "eval_loss" in e and e.get("eval_accuracy") is not None \
+                    and abs(e["eval_accuracy"] - bm) < 1e-9:
+                return e.get("epoch")
+    return None
+
+
+training_args = make_training_args(
+    output_dir=CHECKPOINT_DIR,
+
+    # optimizer & schedule
+    learning_rate=LEARNING_RATE,
+    weight_decay=WEIGHT_DECAY,
+    warmup_steps=WARMUP_STEPS,
+    lr_scheduler_type="linear",
+
+    # batch / VRAM budget (16 GB T4-safe)
+    per_device_train_batch_size=TRAIN_BS,
+    per_device_eval_batch_size=EVAL_BS,
+    gradient_accumulation_steps=ACCUM_STEPS,
+
+    num_train_epochs=NUM_EPOCHS,
+
+    # validation-driven checkpointing — test set is NOT involved anywhere here
+    eval_strategy="epoch",
+    save_strategy="epoch",
+    save_total_limit=2,          # rotate old checkpoints (Kaggle disk is finite)
+    save_only_model=True,        # skip optimizer state in checkpoints (~3× smaller); we never resume mid-run
+    load_best_model_at_end=True,
+    metric_for_best_model="eval_accuracy",
+    greater_is_better=True,
+
+    # logging
+    logging_steps=5 if SMOKE else 100,
+    logging_dir=LOG_DIR,
+    report_to="none" if SMOKE else "tensorboard",
+
+    # performance & reproducibility
+    fp16=torch.cuda.is_available(),
+    dataloader_num_workers=0 if SMOKE else 2,
+    seed=SEED,
+    data_seed=SEED,
+)
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=tokenized_train,
+    eval_dataset=tokenized_val,          # ← validation, never test
+    data_collator=collator,
+    compute_metrics=compute_metrics,
+    callbacks=[
+        EarlyStoppingCallback(
+            early_stopping_patience=EARLY_STOP_PATIENCE,
+            early_stopping_threshold=EARLY_STOP_THRESHOLD,
+        )
+    ],
+)
+
+steps_per_epoch = max(1, math.ceil(len(tokenized_train) / (TRAIN_BS * ACCUM_STEPS)))
+total_steps = steps_per_epoch * NUM_EPOCHS
+print(f"Train samples          : {len(tokenized_train):,}")
+print(f"Val samples            : {len(tokenized_val):,}")
+print(f"Test samples           : {len(tokenized_test):,}  (SEALED)")
+print(f"Optimizer steps/epoch  : {steps_per_epoch:,}   (budget: {total_steps:,} steps, "
+      f"warmup {WARMUP_STEPS} ≈ {WARMUP_RATIO:.0%})")
+print(f"Effective batch size   : {TRAIN_BS * ACCUM_STEPS}")
+print(f"fp16                   : {training_args.fp16}")
+print(f"Early stopping         : patience={EARLY_STOP_PATIENCE}, min Δ={EARLY_STOP_THRESHOLD} on eval_accuracy")
+<<<CODE>>>
+# ══════════════════════════════════════════════════════════════════════════
+# 4b. TRAIN — with wall-clock and peak-VRAM accounting
+# ══════════════════════════════════════════════════════════════════════════
+if torch.cuda.is_available():
+    torch.cuda.reset_peak_memory_stats()
+
+t0 = time.time()
+train_results = trainer.train()
+full_ft_train_min = (time.time() - t0) / 60
+full_ft_peak_vram = (torch.cuda.max_memory_allocated() / 1e9) if torch.cuda.is_available() else float("nan")
+
+print("\nTraining complete!")
+print(f"  Wall-clock     : {full_ft_train_min:.1f} min")
+print(f"  Train loss     : {train_results.metrics['train_loss']:.4f}")
+if torch.cuda.is_available():
+    print(f"  Peak VRAM      : {full_ft_peak_vram:.2f} GB of {torch.cuda.get_device_properties(0).total_memory/1e9:.0f} GB")
+_bm = trainer.state.best_metric
+_be = best_epoch_of(trainer)
+print(f"  Best val acc   : {_bm if _bm is None else format(_bm, '.4f')} "
+      f"(epoch {_be if _be is not None else 'n/a'})")
+print("  (best checkpoint selected on VALIDATION only — the test set is still sealed)")
+<<<CODE>>>
+# ══════════════════════════════════════════════════════════════════════════
+# 4c. SAVE ARTIFACTS — model + tokenizer + metrics + environment fingerprint
+#     On Kaggle everything under /kaggle/working becomes downloadable Output.
+# ══════════════════════════════════════════════════════════════════════════
+trainer.save_model(SAVED_MODEL_DIR)            # validation-best weights + config
+tokenizer.save_pretrained(SAVED_MODEL_DIR)     # vocab + tokenizer config (model is useless without it)
+
+full_ft_metrics = dict(train_results.metrics)
+full_ft_metrics.update({
+    "best_val_accuracy": float(trainer.state.best_metric) if trainer.state.best_metric is not None else None,
+    "best_epoch": best_epoch_of(trainer),
+    "train_time_min": full_ft_train_min,
+    "peak_vram_gb": full_ft_peak_vram,
+    "data_source": data_source,
+    "model_source": f"{MODEL_PATH_RESOLVED} [{MODEL_SOURCE}]",
+})
+with open(os.path.join(SAVED_MODEL_DIR, "train_metrics.json"), "w") as f:
+    json.dump(full_ft_metrics, f, indent=2, default=str)
+with open(os.path.join(SAVED_MODEL_DIR, "environment.json"), "w") as f:
+    json.dump(ENVIRONMENT, f, indent=2)
+
+print(f"Saved to: {SAVED_MODEL_DIR}")
+for fname in sorted(os.listdir(SAVED_MODEL_DIR)):
+    size = os.path.getsize(os.path.join(SAVED_MODEL_DIR, fname))
+    print(f"  {fname:<38} {size / 1e6:>9.2f} MB")
+<<<MD>>>
+## 5. Persistence: Save, Reload and Sanity-Check
+
+Training a model you cannot reload is wasted compute. This section simulates what a **new session**
+would do: load the tokenizer + weights from disk, verify where they live, and run qualitative
+inference on hand-written reviews. The pipeline's labels come out human-readable (`POSITIVE` /
+`NEGATIVE`) because `id2label` was baked into the saved config — in v2 they were `LABEL_0/LABEL_1`
+and the sanity check compared raw strings, which silently breaks when labels change.
+<<<CODE>>>
+# ══════════════════════════════════════════════════════════════════════════
+# 5. RELOAD FROM DISK + QUALITATIVE SANITY CHECK
+# ══════════════════════════════════════════════════════════════════════════
+loaded_tokenizer = AutoTokenizer.from_pretrained(SAVED_MODEL_DIR)
+loaded_model     = AutoModelForSequenceClassification.from_pretrained(SAVED_MODEL_DIR)
+loaded_model.to(DEVICE)
+loaded_model.eval()
+
+print(f"Reloaded from : {SAVED_MODEL_DIR}")
+print(f"Model device  : {next(loaded_model.parameters()).device}")
+print(f"Label mapping : {loaded_model.config.id2label}")
+
+pipe_kwargs = dict(model=loaded_model, tokenizer=loaded_tokenizer, truncation=True)
+if torch.cuda.is_available():
+    pipe_kwargs["device"] = 0
+classifier = pipeline("text-classification", **pipe_kwargs)
+
+probe_reviews = [
+    "This movie was absolutely fantastic! Best film I've seen all year.",
+    "Terrible movie. Waste of time and money. Don't watch this.",
+    "It was okay, nothing special but watchable.",
+    "I loved every minute of it. Highly recommended!",
+    "Boring and predictable. Could not finish watching.",
+]
+print("\n── Qualitative sanity check (reloaded model) ──")
+for i, review in enumerate(probe_reviews, 1):
+    pred = classifier(review)[0]
+    icon = "✅" if pred["label"] == "POSITIVE" else "❌"
+    print(f"  {i}. {pred['label']} {icon} ({pred['score'] * 100:5.1f}%)  |  {review[:64]}")
+print("\nNote: review 3 is genuinely ambiguous — a well-calibrated model SHOULD be unsure there.")
+<<<CODE>>>
+# ══════════════════════════════════════════════════════════════════════════
+# 5b. LEARNING CURVES — diagnose under/overfitting.
+#     Per-epoch train loss is aggregated from the step-level logs (v2 tried
+#     to read 'train_loss' from eval entries, where it never exists — the
+#     panel silently stayed empty; fixed by bucketing step logs by epoch).
+# ══════════════════════════════════════════════════════════════════════════
+log_history = trainer.state.log_history
+
+step_logs = [e for e in log_history if "loss" in e and "eval_loss" not in e]
+eval_logs = [e for e in log_history if "eval_loss" in e]
+
+eval_epochs = [e["epoch"] for e in eval_logs]
+eval_losses = [e["eval_loss"] for e in eval_logs]
+eval_acc    = [e["eval_accuracy"] for e in eval_logs]
+eval_f1     = [e.get("eval_f1") for e in eval_logs]
+
+per_epoch_train = defaultdict(list)
+for e in step_logs:
+    per_epoch_train[max(1, int(e["epoch"]))].append(e["loss"])
+train_loss_epoch = [np.mean(per_epoch_train[int(ep)]) if per_epoch_train.get(int(ep)) else np.nan
+                    for ep in eval_epochs]
+
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+fig.suptitle("Training & Validation Curves — Full Fine-Tuning", fontsize=14, fontweight="bold")
+
+axes[0].plot([e["step"] for e in step_logs], [e["loss"] for e in step_logs],
+             color="steelblue", linewidth=1.5)
+axes[0].set_xlabel("Optimizer step"); axes[0].set_ylabel("Loss")
+axes[0].set_title("Training Loss (step level)"); axes[0].grid(alpha=0.3)
+
+axes[1].plot(eval_epochs, eval_losses, "o-", color="salmon", label="Validation loss", linewidth=2)
+valid_tl = [(ep, v) for ep, v in zip(eval_epochs, train_loss_epoch) if not np.isnan(v)]
+if valid_tl:
+    axes[1].plot([p[0] for p in valid_tl], [p[1] for p in valid_tl],
+                 "s-", color="steelblue", label="Train loss (epoch mean)", linewidth=2)
+if trainer.state.best_metric is not None and best_epoch_of(trainer):
+    _be_plot = best_epoch_of(trainer)
+    axes[1].axvline(_be_plot, color="green", linestyle=":", label=f"best epoch ({_be_plot:g})")
+axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("Loss")
+axes[1].set_title("Loss per Epoch — the train/val gap is overfitting"); axes[1].legend(); axes[1].grid(alpha=0.3)
+
+axes[2].plot(eval_epochs, eval_acc, "o-", color="green", label="Val accuracy", linewidth=2)
+if any(v is not None for v in eval_f1):
+    axes[2].plot(eval_epochs, eval_f1, "s--", color="purple", label="Val F1 (weighted)", linewidth=2)
+lo = max(0.0, min([v for v in eval_acc + [v for v in eval_f1 if v is not None]]) - 0.08)
+axes[2].set_ylim(lo, 1.02)
+axes[2].set_xlabel("Epoch"); axes[2].set_ylabel("Score")
+axes[2].set_title("Validation Accuracy & F1 per Epoch"); axes[2].legend(); axes[2].grid(alpha=0.3)
+
+plt.tight_layout()
+plt.savefig(os.path.join(SAVED_MODEL_DIR, "training_curves.png"), dpi=150, bbox_inches="tight")
+plt.show()
+
+print("Epoch-by-epoch summary:")
+print(f"{'Epoch':>6}{'Val Loss':>10}{'Val Acc':>10}{'Val F1':>10}{'Train Loss':>12}")
+print("-" * 48)
+for ep, vl, va, vf, tl in zip(eval_epochs, eval_losses, eval_acc, eval_f1, train_loss_epoch):
+    vf_s = f"{vf:.4f}" if vf is not None else "N/A"
+    tl_s = f"{tl:.4f}" if not np.isnan(tl) else "N/A"
+    print(f"{ep:>6.0f}{vl:>10.4f}{va:>10.4f}{vf_s:>10}{tl_s:>12}")
+
+print("\nReading these curves: if val loss rises while train loss keeps falling → overfitting;")
+print("early stopping + best-checkpoint selection is precisely the mechanism that caps the damage.")
+<<<MD>>>
+## 6. Sealed Test Evaluation (one-shot protocol)
+
+Everything so far — early stopping, checkpoint choice, and the ablation design in Section 7 — used
+**only train and validation**. Now, and only now, the test set is spent:
+
+1. Reload the artifact from disk (Section 5) — we evaluate *what we would ship*, not what happens to
+   sit in RAM.
+2. One forward pass over all sealed test reviews → predictions.
+3. Classification report + confusion matrix + error analysis.
+
+**What to expect (FULL mode):** BERT-base fine-tuned on IMDB reproducibly lands at ≈ **92–94% test
+accuracy** in the literature; substantially above the ~88–90% of older bag-of-words/LSTM baselines and
+the 50% majority-class floor. In SMOKE mode the numbers are meaningless by design (tiny data, 1 epoch) —
+only the code paths are being validated.
+<<<CODE>>>
+# ══════════════════════════════════════════════════════════════════════════
+# 6. FINAL TEST EVALUATION — the one and only pass over the sealed split
+# ══════════════════════════════════════════════════════════════════════════
+eval_args = make_training_args(
+    output_dir=os.path.join(BASE_DIR, "tmp_eval"),
+    per_device_eval_batch_size=EVAL_BS,
+    fp16=torch.cuda.is_available(),
+    report_to="none",
+    save_strategy="no",
+)
+eval_trainer = Trainer(
+    model=loaded_model,               # the artifact reloaded from disk
+    args=eval_args,
+    data_collator=collator,           # dynamic padding (sequences are variable-length!)
+    compute_metrics=compute_metrics,
+)
+
+t0 = time.time()
+predictions = eval_trainer.predict(tokenized_test)
+test_eval_min = (time.time() - t0) / 60
+
+logits      = predictions.predictions
+true_labels = predictions.label_ids
+pred_labels = np.argmax(logits, axis=1)
+
+# softmax confidences (numpy, no extra deps)
+exp = np.exp(logits - logits.max(axis=1, keepdims=True))
+probs = exp / exp.sum(axis=1, keepdims=True)
+confidence = probs.max(axis=1)
+
+full_ft_acc = accuracy_score(true_labels, pred_labels)
+full_ft_f1  = f1_score(true_labels, pred_labels, average="weighted")
+
+print("=" * 62)
+print("  FINAL TEST SET EVALUATION — Full Fine-Tuning (one-shot)")
+print("=" * 62)
+report_txt = classification_report(true_labels, pred_labels, target_names=LABEL_NAMES, digits=4)
+print(report_txt)
+print(f"Test accuracy: {full_ft_acc:.4f}   Test F1 (weighted): {full_ft_f1:.4f}")
+print(f"({len(true_labels):,} reviews evaluated in {test_eval_min:.1f} min)")
+
+with open(os.path.join(RESULTS_DIR, "test_classification_report.txt"), "w") as f:
+    f.write(f"BERT-base-uncased full fine-tuning — IMDB sealed test set\n")
+    f.write(f"data_source: {data_source}\n")
+    f.write(f"smoke_test: {SMOKE}\n\n{report_txt}\n")
+<<<CODE>>>
+# ══════════════════════════════════════════════════════════════════════════
+# 6b. CONFUSION MATRIX (counts + row-normalized) & ERROR ANALYSIS
+# ══════════════════════════════════════════════════════════════════════════
+cm = confusion_matrix(true_labels, pred_labels)
+cm_norm = cm.astype(float) / cm.sum(axis=1, keepdims=True)
+
+fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=axes[0],
+            xticklabels=LABEL_NAMES, yticklabels=LABEL_NAMES)
+axes[0].set_title("Confusion Matrix — counts (sealed test)")
+sns.heatmap(cm_norm, annot=True, fmt=".2%", cmap="Blues", ax=axes[1],
+            xticklabels=LABEL_NAMES, yticklabels=LABEL_NAMES, vmin=0, vmax=1)
+axes[1].set_title("Confusion Matrix — row-normalized (per-class recall)")
+for ax in axes:
+    ax.set_xlabel("Predicted"); ax.set_ylabel("True")
+plt.tight_layout()
+plt.savefig(os.path.join(SAVED_MODEL_DIR, "confusion_matrix_full_ft.png"), dpi=150, bbox_inches="tight")
+plt.show()
+
+mis_idx = np.where(pred_labels != true_labels)[0]
+print(f"Misclassifications : {len(mis_idx):,} / {len(true_labels):,} "
+      f"(error rate {len(mis_idx) / len(true_labels) * 100:.2f}%)")
+print(f"Mean confidence on correct  : {confidence[pred_labels == true_labels].mean():.3f}")
+if len(mis_idx) > 0:
+    print(f"Mean confidence on errors   : {confidence[mis_idx].mean():.3f}  "
+          f"← errors are less confident: the model often 'knows' it is unsure")
+
+print("\nSample misclassified reviews:")
+for idx in mis_idx[:5]:
+    true_s = LABEL_NAMES[true_labels[idx]]
+    pred_s = LABEL_NAMES[pred_labels[idx]]
+    snippet = actual_test[int(idx)]["text"][:160].replace("\n", " ")
+    print(f"\n  [test idx {int(idx)}]  true={true_s}  pred={pred_s}  conf={confidence[idx]:.2f}")
+    print(f"  {snippet}...")
+
+# Persist the full error set — qualitative error analysis is where research insight comes from
+mis_df = pd.DataFrame({
+    "test_index": mis_idx.astype(int),
+    "true_label": [LABEL_NAMES[t] for t in true_labels[mis_idx]],
+    "pred_label": [LABEL_NAMES[p] for p in pred_labels[mis_idx]],
+    "confidence": confidence[mis_idx].round(4),
+    "text": [actual_test[int(i)]["text"] for i in mis_idx],
+})
+mis_df.to_csv(os.path.join(RESULTS_DIR, "misclassified_examples.csv"), index=False)
+print(f"\nAll {len(mis_df)} misclassified reviews saved to results/misclassified_examples.csv")
+<<<MD>>>
+## 7. Ablation: Layer-Freezing Experiments
+
+**Question:** where does the task-specific knowledge actually live inside a fine-tuned BERT?
+
+**Background.** Probing studies (Rogers et al., 2020 — *A Primer in BERTology*) show lower encoder
+layers learn general, local features (POS-tag-like, shallow syntax) while upper layers learn
+task-relevant semantics. Freezing experiments turn that claim into a measurable trade-off:
+
+| Configuration | Trainable | Hypothesis |
+|---|---|---|
+| **Full fine-tuning** (Section 4–6) | 100% of 110M | ceiling — all layers adapt to sentiment |
+| **Top-4 layers + head** (freeze 0–7) | ~29% | upper layers carry most task adaptation; cheap-ish and nearly as good |
+| **Head only — linear probe** | ~0.15% | BERT-as-feature-extractor: measures how *linearly separable* sentiment already is in pretrained `[CLS]` space |
+
+This is also the historical root of **parameter-efficient fine-tuning**: the linear probe trains a
+vanishing fraction of parameters, and modern methods (LoRA, adapters — the standard toolkit for today's
+LLMs) generalize the same insight: *freeze most of the pretrained trunk, train a small set of new
+parameters*. Freezing also follows the ULMFiT tradition (Howard & Ruder, 2018) of treating layers as a
+budget to unfreeze gradually.
+
+**Controls:** every ablation gets the identical protocol — same data, seed, LR recipe, collator,
+early stopping, and its own one-shot pass over the sealed test set. Only the trainable-parameter
+set varies. Wall-clock and peak VRAM are recorded per configuration, so the table reports
+**accuracy per unit of compute**, not just accuracy.
+<<<CODE>>>
+# ══════════════════════════════════════════════════════════════════════════
+# 7a. FREEZING UTILITIES + EXPERIMENT RUNNER
+# ══════════════════════════════════════════════════════════════════════════
+def freeze_all_encoder_layers(m):
+    """Freeze embeddings + all 12 encoder layers → only the classifier head trains
+    (a 'linear probe' of the pretrained representation)."""
+    for p in m.bert.parameters():
+        p.requires_grad = False
+    return m
+
+
+def freeze_first_n_encoder_layers(m, n=8):
+    """Freeze embeddings + encoder layers 0..n-1; layers n..11 + head stay trainable.
+    (Trainer's optimizer is built from requires_grad=True params only — frozen
+    weights receive no gradient and no optimizer state.)
+    Robust to shallow backbones (e.g. bert-tiny in smoke tests): clamps n so at
+    least the top encoder layer remains trainable."""
+    n_layers = len(m.bert.encoder.layer)
+    n_eff = min(n, n_layers - 1) if n_layers > 1 else 0
+    for p in m.bert.embeddings.parameters():
+        p.requires_grad = False
+    for i in range(n_eff):
+        for p in m.bert.encoder.layer[i].parameters():
+            p.requires_grad = False
+    if n_eff != n:
+        print(f"  (note: backbone has {n_layers} encoder layers — froze {n_eff} instead of {n})")
+    return m
+
+
+def count_trainable(m):
+    total = sum(p.numel() for p in m.parameters())
+    trainable = sum(p.numel() for p in m.parameters() if p.requires_grad)
+    return trainable, total, trainable / total * 100
+
+
+def run_experiment(exp_name, model_, epochs):
+    """Identical protocol to the full fine-tune; only the trainable set differs."""
+    safe = exp_name.lower().replace(" ", "_").replace("-", "_")
+    trainable, total, pct = count_trainable(model_)
+    print("\n" + "=" * 62)
+    print(f"  EXPERIMENT: {exp_name}")
+    print(f"  Trainable : {trainable:,} / {total:,} params ({pct:.2f}%)")
+    print("=" * 62)
+
+    args = make_training_args(
+        output_dir=os.path.join(CHECKPOINT_DIR, safe),
+        learning_rate=LEARNING_RATE, weight_decay=WEIGHT_DECAY,
+        warmup_steps=int(math.ceil(len(tokenized_train) / (TRAIN_BS * ACCUM_STEPS)) * epochs * WARMUP_RATIO),
+        lr_scheduler_type="linear",
+        per_device_train_batch_size=TRAIN_BS,
+        per_device_eval_batch_size=EVAL_BS,
+        gradient_accumulation_steps=ACCUM_STEPS,
+        num_train_epochs=epochs,
+        eval_strategy="epoch", save_strategy="epoch",
+        save_total_limit=2, save_only_model=True,
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_accuracy", greater_is_better=True,
+        logging_steps=5 if SMOKE else 100,
+        logging_dir=LOG_DIR, report_to="none",
+        fp16=torch.cuda.is_available(),
+        dataloader_num_workers=0 if SMOKE else 2,
+        seed=SEED, data_seed=SEED,
+    )
+    t = Trainer(
+        model=model_, args=args,
+        train_dataset=tokenized_train, eval_dataset=tokenized_val,
+        data_collator=collator, compute_metrics=compute_metrics,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=EARLY_STOP_PATIENCE,
+                                         early_stopping_threshold=EARLY_STOP_THRESHOLD)],
+    )
+
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+    t0 = time.time()
+    t.train()
+    train_min = (time.time() - t0) / 60
+    peak_vram = (torch.cuda.max_memory_allocated() / 1e9) if torch.cuda.is_available() else float("nan")
+
+    preds = t.predict(tokenized_test)          # one-shot sealed test evaluation
+    p_lab = np.argmax(preds.predictions, axis=1)
+    test_acc = accuracy_score(preds.label_ids, p_lab)
+    test_f1  = f1_score(preds.label_ids, p_lab, average="weighted")
+
+    _bm_exp = t.state.best_metric
+    _be_exp = best_epoch_of(t)
+    print(f"  → test acc {test_acc:.4f} | test F1 {test_f1:.4f} | {train_min:.1f} min | "
+          f"best val {_bm_exp if _bm_exp is None else format(_bm_exp, '.4f')} "
+          f"@ epoch {_be_exp if _be_exp is not None else 'n/a'}")
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return {
+        "name": exp_name,
+        "trainable_params": trainable,
+        "trainable_pct": pct,
+        "best_val_accuracy": float(t.state.best_metric) if t.state.best_metric is not None else None,
+        "test_accuracy": float(test_acc),
+        "test_f1": float(test_f1),
+        "train_time_min": train_min,
+        "peak_vram_gb": peak_vram,
+        "trainer": t,
+    }
+<<<CODE>>>
+# ══════════════════════════════════════════════════════════════════════════
+# 7b. EXPERIMENT 1 — Head Only (linear probe: 0.15% of params)
+# ══════════════════════════════════════════════════════════════════════════
+result_head_only = None
+if RUN_FREEZING_EXPERIMENTS:
+    model_head_only = freeze_all_encoder_layers(load_fresh_bert())
+    result_head_only = run_experiment("Head Only (linear probe)", model_head_only, epochs=EXP_EPOCHS)
+else:
+    print("RUN_FREEZING_EXPERIMENTS=False — skipping ablations.")
+<<<CODE>>>
+# ══════════════════════════════════════════════════════════════════════════
+# 7c. EXPERIMENT 2 — Top-4 layers + head (freeze embeddings + layers 0..7)
+# ══════════════════════════════════════════════════════════════════════════
+result_top4 = None
+if RUN_FREEZING_EXPERIMENTS:
+    model_top4 = freeze_first_n_encoder_layers(load_fresh_bert(), n=8)
+    result_top4 = run_experiment("Top-4 Layers + Head", model_top4, epochs=EXP_EPOCHS)
+else:
+    print("RUN_FREEZING_EXPERIMENTS=False — skipping ablations.")
+<<<CODE>>>
+# ══════════════════════════════════════════════════════════════════════════
+# 7d. COMPARISON TABLE + CHART (accuracy AND cost per configuration)
+# ══════════════════════════════════════════════════════════════════════════
+rows = [{
+    "Configuration": "Full Fine-Tuning (12 layers)",
+    "Trainable %": 100.0,
+    "Best Val Acc": float(trainer.state.best_metric) if trainer.state.best_metric is not None else None,
+    "Test Accuracy": float(full_ft_acc),
+    "Test F1": float(full_ft_f1),
+    "Train (min)": round(full_ft_train_min, 1),
+    "Peak VRAM (GB)": round(full_ft_peak_vram, 2) if not np.isnan(full_ft_peak_vram) else None,
+}]
+for res in (result_top4, result_head_only):
+    if res is not None:
+        rows.append({
+            "Configuration": res["name"],
+            "Trainable %": round(res["trainable_pct"], 2),
+            "Best Val Acc": res["best_val_accuracy"],
+            "Test Accuracy": res["test_accuracy"],
+            "Test F1": res["test_f1"],
+            "Train (min)": round(res["train_time_min"], 1),
+            "Peak VRAM (GB)": round(res["peak_vram_gb"], 2) if not np.isnan(res["peak_vram_gb"]) else None,
+        })
+
+results_df = pd.DataFrame(rows)
+print("=" * 88)
+print("  LAYER-FREEZING ABLATION — RESULTS" + ("   [SMOKE MODE: numbers are placeholders!]" if SMOKE else ""))
+print("=" * 88)
+print(results_df.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
+results_df.to_csv(os.path.join(RESULTS_DIR, "experiment_comparison.csv"), index=False)
+
+configs = [r["Configuration"].replace(" (", "\n(").replace(" + ", "\n+ ") for r in rows]
+acc_vals = [r["Test Accuracy"] for r in rows]
+f1_vals  = [r["Test F1"] for r in rows]
+
+x = np.arange(len(configs))
+fig, ax = plt.subplots(figsize=(10, 5))
+bars1 = ax.bar(x - 0.2, acc_vals, 0.35, label="Test Accuracy", color="steelblue")
+bars2 = ax.bar(x + 0.2, f1_vals,  0.35, label="Test F1 (weighted)", color="salmon")
+for bar in list(bars1) + list(bars2):
+    ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005,
+            f"{bar.get_height():.3f}", ha="center", va="bottom", fontsize=9)
+ax.set_xticks(x); ax.set_xticklabels(configs, fontsize=10)
+lo = max(0.0, min(acc_vals + f1_vals) - 0.15)
+ax.set_ylim(lo, min(1.05, max(acc_vals + f1_vals) + 0.08))
+ax.set_ylabel("Score")
+ax.set_title("Freezing Ablation — Sealed Test Performance" + (" [SMOKE]" if SMOKE else ""))
+ax.legend(); ax.grid(alpha=0.3, axis="y")
+plt.tight_layout()
+plt.savefig(os.path.join(SAVED_MODEL_DIR, "freezing_experiment_comparison.png"), dpi=150, bbox_inches="tight")
+plt.show()
+<<<CODE>>>
+# ══════════════════════════════════════════════════════════════════════════
+# 7e. VALIDATION DYNAMICS ACROSS CONFIGURATIONS
+#     (how fast does each reach its plateau? how early does it overfit?)
+# ══════════════════════════════════════════════════════════════════════════
+def extract_eval_metrics(trainer_obj):
+    logs = [e for e in trainer_obj.state.log_history if "eval_loss" in e]
+    return ([e["epoch"] for e in logs],
+            [e["eval_loss"] for e in logs],
+            [e["eval_accuracy"] for e in logs])
+
+
+series = [("Full Fine-Tuning", "o-", trainer)]
+if result_top4 is not None:
+    series.append(("Top-4 Layers", "s-", result_top4["trainer"]))
+if result_head_only is not None:
+    series.append(("Head Only", "^-", result_head_only["trainer"]))
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+fig.suptitle("Validation Dynamics Across Freezing Configurations", fontsize=13, fontweight="bold")
+
+all_acc = []
+for name, style, tr in series:
+    eps, losses, accs = extract_eval_metrics(tr)
+    axes[0].plot(eps, losses, style, label=name, linewidth=2)
+    axes[1].plot(eps, accs, style, label=name, linewidth=2)
+    all_acc.extend(accs)
+
+axes[0].set_xlabel("Epoch"); axes[0].set_ylabel("Validation loss")
+axes[0].set_title("Validation Loss per Epoch"); axes[0].legend(); axes[0].grid(alpha=0.3)
+axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("Validation accuracy")
+axes[1].set_title("Validation Accuracy per Epoch")
+if all_acc:
+    axes[1].set_ylim(max(0.0, min(all_acc) - 0.08), 1.0)
+axes[1].legend(); axes[1].grid(alpha=0.3)
+
+plt.tight_layout()
+plt.savefig(os.path.join(SAVED_MODEL_DIR, "all_experiments_curves.png"), dpi=150, bbox_inches="tight")
+plt.show()
+<<<MD>>>
+## 8. Conclusions, Limitations & Reproduction
+
+### What the ablation typically shows (FULL mode)
+- **Full fine-tuning** reaches the ceiling (≈92–94% on the sealed test).
+- **Top-4 layers + head** lands within ~1 point of the ceiling with ~29% of the trainable parameters —
+  evidence that the *upper* layers carry most of the task-specific adaptation, consistent with
+  BERTology probing results.
+- **Head only (linear probe)** is clearly weaker (typically ~85–88%): sentiment is *largely* linearly
+  accessible in the pretrained `[CLS]` representation, but adapting the trunk still buys real accuracy.
+  It also trains fastest per epoch — the classic accuracy-vs-compute trade-off, quantified in the table.
+
+### Limitations (stated honestly, as any report should)
+1. **Single seed.** No error bars — run-to-run variance of ±0.3–0.5% is plausible; rankings near the
+   noise floor would need multi-seed repetition to be trusted.
+2. **Truncation at 512 tokens** discards review endings, where sentiment often resolves.
+3. **Accuracy on balanced classes** is informative here, but per-class recall in the confusion matrix
+   should always be checked for asymmetries.
+4. **Out-of-domain generalization** (e.g. product reviews, tweets) is untested — IMDB→Amazon transfer
+   is the standard next probe.
+5. **Confidence ≠ calibration**: softmax scores are overconfident for fine-tuned transformers;
+   temperature scaling / ECE would be needed to claim calibrated probabilities.
+
+### Future work
+- Multi-seed runs with mean ± std; paired significance tests between configurations.
+- Compare against **DistilBERT** (2× faster) and **DeBERTa-v3** (SOTA ≈96%) at equal budget.
+- Add a **LoRA** arm — bridging this freezing study to modern parameter-efficient LLM fine-tuning.
+- Adversarial/robustness probes (negation flips, contrast sets) instead of accuracy alone.
+
+### Reproduction
+- **Kaggle (full):** GPU T4×2, Internet ON → *Run All* (~2–3.5 h). Offline: attach IMDB CSV +
+  bert-base-uncased mirror (see `docs/KAGGLE_SETUP.md`).
+- **Anywhere (smoke):** `SMOKE_TEST=1` → identical pipeline, tiny subsets, CPU-safe, ~5–10 min.
+- Seeds are fixed (`SEED=42`, `data_seed`), versions are fingerprinted in `saved_model/environment.json`,
+  and all headline numbers are machine-readable in `results/summary.json`.
+
+### References
+- Devlin, Chang, Lee, Toutanova (2019). *BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding.* NAACL.
+- Maas et al. (2011). *Learning Word Vectors for Sentiment Analysis.* ACL. (the IMDB dataset)
+- Howard & Ruder (2018). *Universal Language Model Fine-tuning for Text Classification.* ACL. (layer freezing / gradual unfreezing)
+- Rogers, Kovaleva, Gotz (2020). *A Primer in BERTology: What we know about how BERT works.* TACL.
+- Sun et al. (2019). *How to Fine-Tune BERT for Text Classification?* (fine-tuning recipe evidence)
+- Hu et al. (2022). *LoRA: Low-Rank Adaptation of Large Language Models.* ICLR. (modern PEFT — the descendant of the linear-probe idea)
+<<<CODE>>>
+# ══════════════════════════════════════════════════════════════════════════
+# 8b. MACHINE-READABLE SUMMARY + ARTIFACT INVENTORY
+# ══════════════════════════════════════════════════════════════════════════
+summary = {
+    "smoke_test": SMOKE,
+    "environment": ENVIRONMENT,
+    "data_source": data_source,
+    "model": {"checkpoint": MODEL_PATH_RESOLVED, "source": MODEL_SOURCE, "max_len": MAX_LEN},
+    "protocol": {
+        "n_train": len(tokenized_train), "n_val": len(tokenized_val), "n_test": len(tokenized_test),
+        "seed": SEED, "learning_rate": LEARNING_RATE, "effective_batch": TRAIN_BS * ACCUM_STEPS,
+        "epochs_budget": NUM_EPOCHS, "early_stopping_patience": EARLY_STOP_PATIENCE,
+    },
+    "full_fine_tuning": {
+        "best_val_accuracy": float(trainer.state.best_metric) if trainer.state.best_metric is not None else None,
+        "best_epoch": best_epoch_of(trainer),
+        "test_accuracy": float(full_ft_acc),
+        "test_f1_weighted": float(full_ft_f1),
+        "n_misclassified": int(len(mis_idx)),
+        "train_time_min": round(full_ft_train_min, 2),
+        "peak_vram_gb": (round(full_ft_peak_vram, 2) if not np.isnan(full_ft_peak_vram) else None),
+    },
+    "ablations": [
+        {k: v for k, v in r.items() if k != "trainer"}
+        for r in (result_top4, result_head_only) if r is not None
+    ],
+}
+with open(os.path.join(RESULTS_DIR, "summary.json"), "w") as f:
+    json.dump(summary, f, indent=2, default=str)
+
+print("=" * 62)
+print("  ARTIFACT INVENTORY — " + BASE_DIR)
+print("=" * 62)
+inventory = []
+for root, _, files in os.walk(BASE_DIR):
+    for fn in files:
+        p = os.path.join(root, fn)
+        inventory.append((os.path.relpath(p, BASE_DIR), os.path.getsize(p)))
+inventory.sort(key=lambda t: -t[1])
+for rel, size in inventory[:25]:
+    print(f"  {rel:<58} {size / 1e6:>9.2f} MB")
+if len(inventory) > 25:
+    print(f"  ... and {len(inventory) - 25} more files")
+print(f"\n  TOTAL: {sum(s for _, s in inventory) / 1e6:.1f} MB")
+print("\nOn Kaggle: these files are your Notebook Output — downloadable from the right panel,")
+print("and re-attachable to future notebooks (e.g. an inference-only notebook that skips training).")
+print("\n✅ Done. Key numbers: results/summary.json | report: results/test_classification_report.txt")

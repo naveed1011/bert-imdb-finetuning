@@ -1,0 +1,22 @@
+# Runtime stack — ALL of these are pre-installed in the Kaggle GPU image.
+# This file is for local reproduction only; on Kaggle nothing needs pip-installing.
+# Minimum transformers version matters: `eval_strategy` argument name requires >=4.41.
+
+torch>=2.1
+transformers>=4.41
+datasets>=2.19
+accelerate>=0.30
+scikit-learn>=1.3
+pandas>=2.0
+numpy>=1.26
+matplotlib>=3.7
+seaborn>=0.13
+tqdm>=4.66
+ipywidgets>=8.1
+tensorboard>=2.15        # optional: training logs (report_to="tensorboard")
+
+# Local validation / notebook tooling (not needed on Kaggle)
+nbformat>=5.9
+nbclient>=0.9
+nbconvert>=7.0
+ipykernel>=6.0

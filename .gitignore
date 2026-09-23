@@ -1,0 +1,41 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# --- Jupyter ---
+.ipynb_checkpoints/
+*.nbconvert.ipynb
+*_executed.ipynb
+smoke_executed.ipynb
+
+# --- ML artifacts (too big for git; keep in Kaggle Outputs / HF Hub) ---
+data/raw/
+outputs/
+checkpoints/
+wandb/
+runs/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.onnx
+adapter_model/
+
+# --- Kaggle credentials ---
+kaggle.json
+.kaggle/
+
+# --- Env / secrets ---
+.env
+*.key
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

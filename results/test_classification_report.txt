@@ -1,0 +1,13 @@
+BERT-base-uncased full fine-tuning — IMDB sealed test set
+data_source: Hugging Face Hub — official IMDB split (loaded in 3s)
+smoke_test: False
+
+              precision    recall  f1-score   support
+
+    NEGATIVE     0.9371    0.9374    0.9373     12500
+    POSITIVE     0.9374    0.9370    0.9372     12500
+
+    accuracy                         0.9372     25000
+   macro avg     0.9372    0.9372    0.9372     25000
+weighted avg     0.9372    0.9372    0.9372     25000
+

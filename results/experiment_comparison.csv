@@ -1,0 +1,4 @@
+Configuration,Trainable %,Best Val Acc,Test Accuracy,Test F1,Train (min),Peak VRAM (GB)
+Full Fine-Tuning (12 layers),100.0,0.9356,0.93724,0.9372399974896,107.9,4.57
+Top-4 Layers + Head,26.44,0.9272,0.93332,0.9333189543345143,64.6,4.07
+Head Only (linear probe),0.0,0.6296,0.63284,0.6139148958060239,44.1,3.2

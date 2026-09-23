@@ -1,0 +1,538 @@
+<<<MD>>>
+# 🔬 Fine-Tuning BERT for Sentiment Analysis — IMDB (50k Movie Reviews)
+
+**A rigorous, reproducible transfer-learning study, engineered to run end-to-end on a single Kaggle GPU (T4 ×2 or P100).**
+
+> This notebook is the centerpiece of a learning project that evolved through three versions (v1 → v2 → v3).
+> The repo's [`docs/LEARNING_LOG.md`](https://github.com/YOUR-USERNAME/bert-imdb-finetuning/blob/main/docs/LEARNING_LOG.md)
+> documents the mistakes made along the way — including a **test-set data-leakage bug in v1** — how they were
+> diagnosed and fixed, and why the current design decisions were made.
+
+### What you will see in this notebook
+1. **A strict evaluation protocol** — train / validation / *sealed* test split, and why it matters
+2. **Exploratory data analysis** — label balance, review-length distribution, truncation budget
+3. **Tokenizer internals** — what BERT actually consumes (WordPiece, `[CLS]`, attention masks)
+4. **Full fine-tuning** of `bert-base-uncased` (~110M params) with early stopping
+5. **Persistence** — save the best checkpoint, reload from disk, sanity-check inference
+6. **One-shot test evaluation** — classification report, confusion matrix, error analysis
+7. **An ablation study** — full fine-tuning vs top-4-layers unfrozen vs linear probe (head only)
+8. **Reproducibility artifacts** — environment fingerprint, `summary.json`, result CSVs, figures
+
+### How to run it
+| Mode | Where | What happens |
+|---|---|---|
+| **FULL** | Kaggle, GPU T4×2 or P100, ~2–3.5 h | Everything, 22.5k training reviews, up to 5 epochs with early stopping |
+| **SMOKE** | Anywhere (CPU is fine), ~5–10 min | Env var `SMOKE_TEST=1` → the *same* pipeline on tiny subsets; validates every code path cheaply |
+
+On Kaggle: set **Accelerator → GPU T4 x2** and **Internet → On** (simplest). A fully **offline** run is also
+supported: attach the IMDB CSV and a BERT weights mirror as Kaggle Datasets and the notebook auto-detects them
+(see `docs/KAGGLE_SETUP.md`).
+
+### Table of contents
+0. Configuration & Environment
+1. Data: Loading & the Split Protocol *(the leakage story)*
+2. Tokenization: From Text to Tensors
+3. Model: BERT-base + Classification Head
+4. Full Fine-Tuning
+5. Persistence: Save, Reload, Sanity-Check
+6. Sealed Test Evaluation *(one-shot protocol)*
+7. Ablation: Layer-Freezing Experiments
+8. Conclusions, Limitations & Reproduction
+<<<MD>>>
+## 0. Configuration & Environment
+
+Everything tunable lives in **one cell** — a single source of truth. The notebook reads two environment
+variables so that the *same artifact* runs in three contexts without edits:
+
+| Context | Env vars | Effect |
+|---|---|---|
+| Kaggle, real run | *(none)* | full data, 512 tokens, GPU, artifacts → `/kaggle/working` |
+| Kaggle, dry run | `SMOKE_TEST=1` | tiny subsets, 64 tokens — verifies the notebook before burning GPU hours |
+| Local machine (CPU) | `SMOKE_TEST=1` | same dry run, artifacts → `./outputs` |
+
+**Why `/kaggle/working`?** On Kaggle it is the only directory that (a) is writable and (b) persists as
+*Notebook Output* — so the trained model, figures and metrics you produce are downloadable after the run.
+<<<CODE>>>
+# ══════════════════════════════════════════════════════════════════════════
+# 0. CONFIGURATION — single source of truth
+# ══════════════════════════════════════════════════════════════════════════
+import os, sys, json, glob, math, time
+from collections import defaultdict
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+import torch
+import transformers
+import datasets as hf_datasets
+from datasets import load_dataset, Dataset
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    TrainingArguments,
+    Trainer,
+    DataCollatorWithPadding,
+    pipeline,
+    set_seed,
+)
+from transformers.trainer_callback import EarlyStoppingCallback
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score,
+    f1_score, confusion_matrix, classification_report,
+)
+from sklearn.model_selection import train_test_split
+
+# ── Mode & platform detection ─────────────────────────────────────────────
+SMOKE     = os.environ.get("SMOKE_TEST", "0") == "1"
+ON_KAGGLE = ("KAGGLE_KERNEL_RUN_TYPE" in os.environ) or os.path.isdir("/kaggle/working")
+DEVICE    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ── Reproducibility ───────────────────────────────────────────────────────
+SEED = 42
+set_seed(SEED)                      # seeds python, numpy, torch (CPU+CUDA) and transformers
+
+# ── Task & model ──────────────────────────────────────────────────────────
+DEFAULT_CHECKPOINT = "bert-base-uncased"
+LABEL_NAMES = ["NEGATIVE", "POSITIVE"]
+ID2LABEL    = {i: n for i, n in enumerate(LABEL_NAMES)}
+LABEL2ID    = {n: i for i, n in enumerate(LABEL_NAMES)}
+MAX_LEN     = 64 if SMOKE else 512      # BERT's positional-embedding ceiling is 512
+
+# ── Training schedule ─────────────────────────────────────────────────────
+NUM_EPOCHS   = 1 if SMOKE else 5        # full fine-tuning budget (early stopping usually ends it sooner)
+EXP_EPOCHS   = 1 if SMOKE else 5        # budget for each freezing ablation
+TRAIN_BS     = 4 if SMOKE else 8        # per-device batch (safe on a 16 GB T4 @ 512 tokens, fp16)
+EVAL_BS      = 8 if SMOKE else 16       # eval is forward-only → can afford larger batches
+ACCUM_STEPS  = 1 if SMOKE else 4        # effective batch = 8 × 4 = 32 (the BERT-paper FT recipe)
+LEARNING_RATE      = 2e-5
+WEIGHT_DECAY       = 0.01
+WARMUP_RATIO       = 0.0 if SMOKE else 0.1
+EARLY_STOP_PATIENCE   = 2
+EARLY_STOP_THRESHOLD  = 0.001
+RUN_FREEZING_EXPERIMENTS = True         # set False to run only the full fine-tune
+SMOKE_SUBSETS = {"train": 64, "val": 32, "test": 32}
+
+# ── Artifact paths (Kaggle-aware) ─────────────────────────────────────────
+BASE_DIR        = "/kaggle/working" if ON_KAGGLE else os.path.join(os.getcwd(), "outputs")
+SAVED_MODEL_DIR = os.path.join(BASE_DIR, "saved_model")     # best full-FT model + tokenizer
+RESULTS_DIR     = os.path.join(BASE_DIR, "results")         # reports, CSVs, summary.json
+CHECKPOINT_DIR  = os.path.join(BASE_DIR, "checkpoints")     # Trainer checkpoints (rotated)
+LOG_DIR         = os.path.join(BASE_DIR, "logs")            # tensorboard logs
+for _d in (BASE_DIR, SAVED_MODEL_DIR, RESULTS_DIR, CHECKPOINT_DIR, LOG_DIR):
+    os.makedirs(_d, exist_ok=True)
+
+# ── Environment fingerprint (reproducibility: numbers mean nothing without it) ─
+ENVIRONMENT = {
+    "python": sys.version.split()[0],
+    "torch": torch.__version__,
+    "torch_cuda": torch.version.cuda,
+    "transformers": transformers.__version__,
+    "datasets": hf_datasets.__version__,
+    "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "none (CPU)",
+    "on_kaggle": ON_KAGGLE,
+    "smoke_test": SMOKE,
+}
+
+print("=" * 72)
+print("  BERT × IMDB Sentiment — Configuration")
+print("=" * 72)
+print(f"  Mode           : {'SMOKE TEST (tiny subsets — validates code paths)' if SMOKE else 'FULL RUN'}")
+print(f"  Environment    : {'Kaggle' if ON_KAGGLE else 'Local'}")
+print(f"  Device         : {DEVICE}")
+if torch.cuda.is_available():
+    print(f"  GPU            : {torch.cuda.get_device_name(0)}")
+    print(f"  VRAM           : {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+print(f"  Artifacts dir  : {BASE_DIR}")
+print(f"  python {ENVIRONMENT['python']} | torch {ENVIRONMENT['torch']} | "
+      f"transformers {ENVIRONMENT['transformers']} | datasets {ENVIRONMENT['datasets']}")
+print(f"  MAX_LEN={MAX_LEN}  epochs={NUM_EPOCHS}  batch={TRAIN_BS}×accum{ACCUM_STEPS} "
+      f"(effective {TRAIN_BS * ACCUM_STEPS})  lr={LEARNING_RATE}")
+<<<MD>>>
+## 1. Data: Loading & the Split Protocol
+
+### The v1 mistake this design exists to prevent
+IMDB ships an **official 25k-train / 25k-test split** (Maas et al., 2011). In v1 of this project the
+official **test** split was used for model selection during training (early stopping, best-checkpoint
+picking). That is **data leakage**: every "keep or discard this checkpoint" decision was implicitly
+fitted to the test set, so the reported test accuracy was optimistically biased — the number looked
+good but no longer estimated generalization to unseen data.
+
+### The protocol used from v2 onward
+```
+IMDB official train (25,000)
+    ├── 90%  → train (22,500)   the ONLY data the optimizer ever sees
+    └── 10%  → val   (2,500)    early stopping + checkpoint selection
+
+IMDB official test  (25,000)
+    └── SEALED — loaded, never touched until Section 6, evaluated EXACTLY ONCE
+```
+**Rule of thumb: the test set is a budget you spend once.** Touch it repeatedly (or tune against it)
+and it silently becomes a second validation set.
+
+### Data sources (auto-detected, in priority order)
+1. `DATA_CSV` env var → explicit CSV path (any environment)
+2. **Hugging Face Hub** official split → default when internet is available (results comparable to literature)
+3. **Kaggle-attached CSV** (e.g. `lakshmi25npathi/imdb-dataset-of-50k-movie-reviews`) → offline fallback.
+   The CSV pools the official train+test reviews, so membership of the official split cannot be
+   recovered; we rebuild a **stratified 45% / 5% / 50%** split (same sizes as the official protocol).
+   Numbers from this mode are internally comparable, not literature-comparable.
+<<<CODE>>>
+# ══════════════════════════════════════════════════════════════════════════
+# 1a. DATA LOADING — HF hub (official split) with Kaggle-CSV fallback
+# ══════════════════════════════════════════════════════════════════════════
+def find_attached_csv():
+    """Scan /kaggle/input for an attached IMDB CSV (any common naming)."""
+    patterns = [
+        "/kaggle/input/*/IMDB*Dataset*.csv",
+        "/kaggle/input/*/IMDB*.csv",
+        "/kaggle/input/*/*imdb*.csv",
+    ]
+    for pat in patterns:
+        hits = [p for p in sorted(glob.glob(pat)) if os.path.isfile(p)]
+        if hits:
+            return hits[0]
+    return None
+
+
+def imdb_from_csv(path):
+    """Load a 50k-review CSV and rebuild train/val/test at the official ratios
+    (45% / 5% / 50%), stratified by label so both classes keep parity everywhere."""
+    df = pd.read_csv(path)
+    text_col = "review" if "review" in df.columns else "text"
+
+    if "sentiment" in df.columns:                       # lakshmi25npathi format: review, sentiment
+        sent = df["sentiment"].astype(str).str.strip().str.lower()
+        keep = sent.isin(["positive", "negative"])
+        df, sent = df[keep].copy(), sent[keep]
+        labels = (sent == "positive").astype(int).values
+    elif "label" in df.columns:                         # alternative mirrors: text, label
+        lab = df["label"].astype(str).str.strip().str.lower()
+        keep = lab.isin(["positive", "negative", "0", "1"])
+        df, lab = df[keep].copy(), lab[keep]
+        labels = lab.map({"negative": 0, "positive": 1, "0": 0, "1": 1}).astype(int).values
+    else:
+        raise ValueError(f"{path}: expected a 'sentiment' or 'label' column, got {list(df.columns)}")
+
+    clean = pd.DataFrame({"text": df[text_col].astype(str).values, "label": labels})
+    trainval, test  = train_test_split(clean, test_size=0.50, stratify=clean["label"], random_state=SEED)
+    train, val      = train_test_split(trainval, test_size=0.10, stratify=trainval["label"], random_state=SEED)
+
+    to_ds = lambda d: Dataset.from_pandas(d.reset_index(drop=True), preserve_index=False)
+    return to_ds(train), to_ds(val), to_ds(test)
+
+
+forced_csv   = os.environ.get("DATA_CSV")
+attached_csv = find_attached_csv() if ON_KAGGLE else None
+actual_train = actual_val = actual_test = None
+
+if forced_csv:
+    actual_train, actual_val, actual_test = imdb_from_csv(forced_csv)
+    data_source = f"CSV via DATA_CSV env var: {forced_csv} (stratified 45/5/50 rebuild)"
+else:
+    try:
+        t0 = time.time()
+        # split=["train","test"] skips the 50k *unsupervised* split → ~40 MB less download.
+        # Canonical namespaced repo id first (required by datasets>=5; the bare "imdb"
+        # alias only resolves on older versions), bare alias as fallback for old images.
+        hf_train = hf_test = None
+        for repo_id in ("stanfordnlp/imdb", "imdb"):
+            try:
+                hf_train, hf_test = load_dataset(repo_id, split=["train", "test"])
+                break
+            except Exception:
+                if repo_id == "imdb":
+                    raise
+        # Carve validation out of TRAIN. The official test split stays sealed.
+        carved = hf_train.train_test_split(test_size=0.10, seed=SEED)
+        actual_train, actual_val = carved["train"], carved["test"]
+        actual_test = hf_test
+        data_source = f"Hugging Face Hub — official IMDB split (loaded in {time.time()-t0:.0f}s)"
+    except Exception as e:
+        if attached_csv is None:
+            raise RuntimeError(
+                "\nCould not load IMDB from the Hugging Face Hub, and no IMDB CSV is attached.\n"
+                "On Kaggle, do ONE of:\n"
+                "  1) Notebook settings → Internet → On   (downloads the official split), or\n"
+                "  2) Input → attach 'lakshmi25npathi/imdb-dataset-of-50k-movie-reviews'\n"
+                "     (the notebook auto-detects the CSV and rebuilds equivalent splits).\n"
+                "Locally: check your connection, or set DATA_CSV='/path/to/IMDB Dataset.csv'.\n"
+                f"Original error: {type(e).__name__}: {e}"
+            ) from e
+        actual_train, actual_val, actual_test = imdb_from_csv(attached_csv)
+        data_source = (f"Kaggle-attached CSV: {attached_csv}\n"
+                       "  (offline mode: stratified 45/5/50 rebuild — internally comparable, "
+                       "NOT identical to the official split)")
+
+print(f"Data source : {data_source}")
+print(f"Raw sizes   : train={len(actual_train):,}  val={len(actual_val):,}  test={len(actual_test):,}")
+<<<CODE>>>
+# ══════════════════════════════════════════════════════════════════════════
+# 1b. SPLIT SUMMARY — in SMOKE mode shrink to tiny balanced subsets
+#     (.shuffle BEFORE .select: the raw IMDB split is label-ordered —
+#      first 12,500 negative, then 12,500 positive — taking the first N
+#      rows without shuffling would give a single-class subset!)
+# ══════════════════════════════════════════════════════════════════════════
+if SMOKE:
+    actual_train = actual_train.shuffle(seed=SEED).select(range(min(SMOKE_SUBSETS["train"], len(actual_train))))
+    actual_val   = actual_val.shuffle(seed=SEED).select(range(min(SMOKE_SUBSETS["val"],   len(actual_val))))
+    actual_test  = actual_test.shuffle(seed=SEED).select(range(min(SMOKE_SUBSETS["test"],  len(actual_test))))
+    print("SMOKE mode: using tiny subsets (pipeline validation, NOT real results)\n")
+
+total = len(actual_train) + len(actual_val) + len(actual_test)
+print(f"{'Split':<18}{'Samples':>10}{'Role':>44}")
+print("-" * 72)
+print(f"{'Train':<18}{len(actual_train):>10,}{'the only data the optimizer sees':>44}")
+print(f"{'Validation':<18}{len(actual_val):>10,}{'early stopping + checkpoint selection':>44}")
+print(f"{'Test (SEALED)':<18}{len(actual_test):>10,}{'evaluated exactly once, in Section 6':>44}")
+print(f"{'Total':<18}{total:>10,}")
+
+
+def label_counts(split, name):
+    labels = split["label"]
+    pos, neg = labels.count(1), labels.count(0)
+    n = len(labels)
+    return {"Split": name, "Positive": pos, "Negative": neg,
+            "Pos%": f"{pos / n * 100:.1f}%", "Neg%": f"{neg / n * 100:.1f}%"}
+
+
+dist_df = pd.DataFrame([
+    label_counts(actual_train, "Train"),
+    label_counts(actual_val,   "Validation"),
+    label_counts(actual_test,  "Test"),
+])
+print("\nLabel distribution (IMDB is perfectly balanced by construction —")
+print("balanced classes mean accuracy is meaningful; we still report F1/precision/recall):")
+print(dist_df.to_string(index=False))
+<<<CODE>>>
+# ══════════════════════════════════════════════════════════════════════════
+# 1c. EXPLORATORY DATA ANALYSIS — computed on TRAIN ONLY.
+#     (Peeking at test statistics — even unlabeled ones like length — is a
+#      mild form of leakage; discipline here costs nothing.)
+# ══════════════════════════════════════════════════════════════════════════
+word_counts = [len(t.split()) for t in actual_train["text"]]
+wc = np.array(word_counts)
+print("Train review length (words):")
+for stat, val in [("Min", wc.min()), ("Median", np.median(wc)), ("Mean", wc.mean()),
+                  ("P95", np.percentile(wc, 95)), ("Max", wc.max())]:
+    print(f"  {stat:<7}: {val:,.0f}")
+
+fig, axes = plt.subplots(1, 3, figsize=(16, 4))
+
+# 1) Length histogram with the model's token budget marked
+axes[0].hist(word_counts, bins=50, color="steelblue", edgecolor="black", alpha=0.7)
+axes[0].axvline(wc.mean(),   color="red",   linestyle="--", label=f"Mean {wc.mean():.0f}")
+axes[0].axvline(np.median(wc), color="green", linestyle="--", label=f"Median {np.median(wc):.0f}")
+axes[0].axvline(MAX_LEN, color="orange", linewidth=2, label=f"MAX_LEN {MAX_LEN}")
+axes[0].set_xlabel("Word count"); axes[0].set_ylabel("Frequency")
+axes[0].set_title("Review Length Distribution (train)")
+axes[0].legend(); axes[0].grid(alpha=0.3)
+
+# 2) Box plot — the long right tail is what forces truncation decisions
+axes[1].boxplot(word_counts, patch_artist=True, boxprops=dict(facecolor="steelblue", alpha=0.6))
+axes[1].set_ylabel("Word count"); axes[1].set_title("Review Length Box Plot (train)")
+axes[1].grid(alpha=0.3)
+
+# 3) Class balance per split
+names = ["Train", "Validation", "Test"]
+pos = [label_counts(s, n)["Positive"] for s, n in zip([actual_train, actual_val, actual_test], names)]
+neg = [label_counts(s, n)["Negative"] for s, n in zip([actual_train, actual_val, actual_test], names)]
+x = np.arange(len(names))
+axes[2].bar(x - 0.2, pos, 0.4, label="Positive", color="steelblue")
+axes[2].bar(x + 0.2, neg, 0.4, label="Negative", color="salmon")
+axes[2].set_xticks(x); axes[2].set_xticklabels(names)
+axes[2].set_ylabel("Count"); axes[2].set_title("Label Balance per Split")
+axes[2].legend(); axes[2].grid(alpha=0.3)
+
+plt.tight_layout()
+plt.savefig(os.path.join(RESULTS_DIR, "eda_overview.png"), dpi=150, bbox_inches="tight")
+plt.show()
+
+over_budget = int((wc > MAX_LEN).sum())
+print(f"\n~{over_budget / len(wc) * 100:.1f}% of train reviews exceed MAX_LEN={MAX_LEN} *words* "
+      f"and will be truncated (WordPiece usually produces MORE tokens than words;")
+print(" exact token-level statistics are measured after tokenization, in Section 2).")
+<<<MD>>>
+## 2. Tokenization: From Text to Tensors
+
+BERT does not see words or characters — it sees **WordPiece subwords** as integer IDs. Three tensors
+describe one example:
+
+| Tensor | Meaning |
+|---|---|
+| `input_ids` | vocab IDs, framed by `[CLS]` (start / classification summary slot) and `[SEP]` (end) |
+| `attention_mask` | `1` = real token, `0` = padding — tells attention what to ignore |
+| `token_type_ids` | sentence A vs B (all zeros here; matters for sentence-pair tasks) |
+
+For classification, the final hidden state at `[CLS]` becomes the whole review's representation —
+the head in Section 3 is a single `Linear(768 → 2)` on top of it.
+
+### A deliberate change from v2: dynamic padding
+v2 tokenized with `padding="max_length"` → **every** review, even a 20-word one, became a 512-token
+tensor. Attention compute scales with sequence length, so most of the GPU budget was spent on `[PAD]`
+tokens. v3 stores sequences at their **natural length** and lets a `DataCollatorWithPadding` pad each
+*batch* to the longest member *of that batch*. Same math, far less wasted FLOPs (IMDB reviews average
+~230 words, so ~2× less padding work on average) and less memory — the reason batch 8 fits comfortably
+on a 16 GB T4.
+
+**Truncation is a real modeling trade-off**: sentiment cues can sit at the *end* of a long review, and
+`truncation=True` keeps only the first `MAX_LEN` tokens. We quantify exactly how much signal is cut below.
+<<<CODE>>>
+# ══════════════════════════════════════════════════════════════════════════
+# 2a. TOKENIZER — resolve the checkpoint (env var → Kaggle Input → HF Hub)
+#     so the notebook also works with Internet OFF, provided BERT weights
+#     are attached as a Kaggle Dataset.
+# ══════════════════════════════════════════════════════════════════════════
+def resolve_model_checkpoint():
+    env_path = os.environ.get("MODEL_PATH")
+    if env_path:
+        return env_path, "environment variable MODEL_PATH"
+    if ON_KAGGLE:
+        for pat in ("/kaggle/input/*", "/kaggle/input/*/*"):
+            for d in sorted(glob.glob(pat)):
+                if os.path.isdir(d) and os.path.isfile(os.path.join(d, "config.json")) and (
+                    os.path.isfile(os.path.join(d, "vocab.txt"))
+                    or glob.glob(os.path.join(d, "*.safetensors"))
+                    or glob.glob(os.path.join(d, "pytorch_model*.bin"))
+                ):
+                    return d, "Kaggle Input (attached model dataset)"
+    return DEFAULT_CHECKPOINT, "Hugging Face Hub"
+
+
+MODEL_PATH_RESOLVED, MODEL_SOURCE = resolve_model_checkpoint()
+print(f"Base model : {MODEL_PATH_RESOLVED}")
+print(f"Source     : {MODEL_SOURCE}")
+
+try:
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH_RESOLVED)
+except Exception as e:
+    raise RuntimeError(
+        "\nCould not download the base model. On Kaggle with Internet OFF, attach a "
+        "'bert-base-uncased' mirror as a Kaggle Dataset (Input → Add Input → Datasets),\n"
+        "or set MODEL_PATH='/kaggle/input/<your-bert-dir>'.\n"
+        f"Original error: {type(e).__name__}: {e}"
+    ) from e
+
+# ── Inspect ONE sample first: understand the tensors before mass-producing them ──
+sample_text = actual_train[0]["text"][:300]
+tokens = tokenizer(sample_text, truncation=False)
+
+print("\n" + "=" * 60)
+print("TOKENIZER INSPECTION (single sample)")
+print("=" * 60)
+print(f"Text snippet : {sample_text[:80]}...")
+print(f"Keys         : {list(tokens.keys())}")
+print(f"\nFirst 10 IDs : {tokens['input_ids'][:10]}")
+print(f"Decoded      : {tokenizer.convert_ids_to_tokens(tokens['input_ids'][:10])}")
+print(f"\n[CLS] id={tokenizer.cls_token_id} → position 0; its final hidden state is the")
+print(f"               review-level representation used for classification.")
+print(f"[SEP] id={tokenizer.sep_token_id} → marks sequence end.")
+print(f"[PAD] id={tokenizer.pad_token_id} → ignored via attention_mask=0.")
+print(f"\nUncapped length of this sample: {len(tokens['input_ids'])} tokens (cap: {MAX_LEN})")
+<<<CODE>>>
+# ══════════════════════════════════════════════════════════════════════════
+# 2b. TOKENIZE ALL SPLITS — truncation yes, padding NO (collator pads per batch)
+# ══════════════════════════════════════════════════════════════════════════
+def tokenize_function(examples):
+    return tokenizer(examples["text"], truncation=True, max_length=MAX_LEN)
+
+
+map_kwargs = dict(batched=True, batch_size=100 if SMOKE else 1000)
+tokenized_train = actual_train.map(tokenize_function, desc="Tokenizing train", **map_kwargs)
+tokenized_val   = actual_val.map(tokenize_function,   desc="Tokenizing val",   **map_kwargs)
+tokenized_test  = actual_test.map(tokenize_function,  desc="Tokenizing test",  **map_kwargs)
+
+# ── Measure the truncation budget (train only) ────────────────────────────
+train_lens = np.array([len(ids) for ids in tokenized_train["input_ids"]])
+print("\nTokenized train length (subword tokens):")
+for stat, val in [("Min", train_lens.min()), ("Median", np.median(train_lens)),
+                  ("Mean", train_lens.mean()), ("P95", np.percentile(train_lens, 95)),
+                  ("Max", train_lens.max())]:
+    print(f"  {stat:<7}: {val:,.0f}")
+at_cap = float((train_lens >= MAX_LEN).mean())
+print(f"\n{at_cap * 100:.1f}% of train reviews hit the MAX_LEN={MAX_LEN} cap (truncated —")
+print(" their ending is discarded). At 512 this is a small fraction of IMDB;")
+print(" it is the price of BERT's fixed positional embeddings.")
+print(f"\nDynamic padding saves compute: mean length {train_lens.mean():.0f} vs cap {MAX_LEN} "
+      f"→ batches carry ~{(1 - train_lens.mean() / MAX_LEN) * 100:.0f}% fewer padded positions on average.")
+
+plt.figure(figsize=(9, 4))
+plt.hist(train_lens, bins=60, color="steelblue", edgecolor="black", alpha=0.7)
+plt.axvline(MAX_LEN, color="orange", linewidth=2, label=f"MAX_LEN={MAX_LEN} cap")
+plt.axvline(train_lens.mean(), color="red", linestyle="--", label=f"Mean {train_lens.mean():.0f}")
+plt.xlabel("Tokens per review"); plt.ylabel("Frequency")
+plt.title("Tokenized Length Distribution (train) — what the model actually consumes")
+plt.legend(); plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.savefig(os.path.join(RESULTS_DIR, "token_length_distribution.png"), dpi=150, bbox_inches="tight")
+plt.show()
+<<<MD>>>
+## 3. Model: BERT-base + Classification Head
+
+`bert-base-uncased` (Devlin et al., 2019): 12 transformer encoder layers, hidden size 768,
+12 attention heads, ~110M parameters. For sequence classification, Hugging Face appends a head:
+
+```
+[CLS] review tokens [SEP]  →  12 encoder layers  →  pooled [CLS] (768-d)  →  Dropout  →  Linear(768→2)
+```
+
+The head is randomly initialized — **that ~0.15% of parameters is the only part that starts from
+scratch**; everything else begins from masked-LM pre-training on BookCorpus + English Wikipedia.
+This asymmetry (huge pretrained trunk, tiny fresh head) is exactly what Section 7 exploits.
+
+`id2label` is set explicitly so every report, plot and prediction speaks *NEGATIVE/POSITIVE*
+instead of the meaningless `LABEL_0/LABEL_1` (a small readability fix over v2).
+<<<CODE>>>
+# ══════════════════════════════════════════════════════════════════════════
+# 3. MODEL — factory function so ablations can load fresh copies later
+# ══════════════════════════════════════════════════════════════════════════
+def load_fresh_bert():
+    """A fresh BERT-base + classification head (used again for each freezing ablation)."""
+    return AutoModelForSequenceClassification.from_pretrained(
+        MODEL_PATH_RESOLVED,
+        num_labels=2,
+        id2label=ID2LABEL,
+        label2id=LABEL2ID,
+        problem_type="single_label_classification",
+    )
+
+
+model = load_fresh_bert()
+
+# ── Parameter accounting: know exactly what you are training ──────────────
+total_params     = sum(p.numel() for p in model.parameters())
+trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+print(f"{'Total parameters':<26}: {total_params:>12,}")
+print(f"{'Trainable (now)':<26}: {trainable_params:>12,}")
+print("\nTop-level modules:")
+for name, module in model.named_children():
+    n = sum(p.numel() for p in module.parameters())
+    print(f"  {name:<22} → {n:>11,} params")
+print("\nClassification head (the only randomly-initialized part):")
+print(f"  {model.classifier}")
+<<<CODE>>>
+# ══════════════════════════════════════════════════════════════════════════
+# 3b. METRICS & DATA COLLATOR
+# ══════════════════════════════════════════════════════════════════════════
+def compute_metrics(eval_pred):
+    """Runs at every evaluation; results land in trainer.state.log_history
+    and drive early stopping + best-checkpoint selection."""
+    logits, labels = eval_pred.predictions, eval_pred.label_ids
+    preds = np.argmax(logits, axis=1)
+    return {
+        "accuracy":  accuracy_score(labels, preds),
+        # weighted averages: with balanced classes they ≈ macro averages,
+        # but they stay meaningful if a subset (e.g. smoke test) is skewed.
+        "f1":        f1_score(labels, preds, average="weighted", zero_division=0),
+        "precision": precision_score(labels, preds, average="weighted", zero_division=0),
+        "recall":    recall_score(labels, preds, average="weighted", zero_division=0),
+    }
+
+
+# Pads each batch to its own longest sequence (the dynamic-padding win from Section 2).
+# Without it, Trainer's default collator would crash on variable-length inputs.
+collator = DataCollatorWithPadding(tokenizer=tokenizer)
+
+print("compute_metrics → accuracy / f1 / precision / recall (weighted)")
+print("collator        → DataCollatorWithPadding (per-batch dynamic padding)")
