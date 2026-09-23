@@ -75,3 +75,19 @@ bert-imdb-finetuning/
     ├── confusion_matrix_full_ft.png
     ├── freezing_experiment_comparison.png
     └── all_experiments_curves.png
+
+---
+
+## Author
+
+**Naveed Ahmad**
+* GitHub: [@naveed1011](https://github.com/naveed1011)
+* Project Repository: [bert-imdb-finetuning](https://github.com/naveed1011/bert-imdb-finetuning)
+
+If you found this project useful or learned something from the layer-freezing ablation experiments, please consider giving it a star ⭐️ on [GitHub](https://github.com/naveed1011/bert-imdb-finetuning)!
+
+---
+
+## License
+
+This project is licensed under the MIT License — see the [LICENSE](https://github.com/naveed1011/bert-imdb-finetuning/blob/main/LICENSE) file for details.
