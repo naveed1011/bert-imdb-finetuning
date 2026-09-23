@@ -75,6 +75,7 @@ bert-imdb-finetuning/
     ├── confusion_matrix_full_ft.png
     ├── freezing_experiment_comparison.png
     └── all_experiments_curves.png
+```
 
 ---
 
