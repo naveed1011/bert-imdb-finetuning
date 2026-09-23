@@ -51,6 +51,7 @@ All figures and raw data are in the [`results/`](results/) folder. Key numbers a
 
 ## Repository Structure
 
+```text
 bert-imdb-finetuning/
 ├── README.md
 ├── LICENSE                         # MIT
